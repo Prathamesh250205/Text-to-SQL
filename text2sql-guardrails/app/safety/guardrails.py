@@ -1,0 +1,235 @@
+"""
+Static SQL guardrails: AST-level checks that run on generated SQL before it
+is ever executed. Pure logic -- no DB connection, no LLM call, no I/O. This
+is step 3, the "may BLOCK here" step, in the pipeline order documented in
+app/api/routes.py::run_query()'s docstring -- done for real via sqlglot
+instead of keyword string-matching on the question text.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import ParseError
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Statement types that are never allowed, regardless of read/write intent.
+_DDL_BLOCK_TYPES = (exp.Drop, exp.Create, exp.Alter, exp.TruncateTable)
+# Statement types that mutate data.
+_DML_BLOCK_TYPES = (exp.Insert, exp.Update, exp.Delete, exp.Merge)
+
+# Functions that change session or server state despite being callable from
+# inside a plain SELECT. See eval/FINDINGS.md section 10.
+#
+# set_config() is the one that matters. It is an ordinary VOLATILE function
+# returning text, so `SELECT set_config('app.student_id','87',true), id
+# FROM marks` is a single read-only statement that passes every other check
+# here -- and it rewrites the session variable a Row Level Security policy
+# reads, mid-scan. Nine of ten attack shapes tested bypassed the policy that
+# way. pg_catalog.set_config(...) and "set_config"(...) normalise to the
+# same name once sqlglot has parsed them, so the bare name covers both.
+#
+# current_setting() is blocked too, though it only READS. Analytics SQL over
+# this schema has no legitimate use for it, and being able to read the
+# current value is what lets an attacker restore it before the statement
+# ends, which is precisely how the post-execution re-assertion in
+# app/api/routes.py can be evaded. Removing the read removes the easy path
+# to that evasion.
+#
+# THIS IS A DENYLIST AND IS TREATED AS NOISE REDUCTION, NOT AS A CONTROL.
+# It stops the shapes known today. It cannot stop a function that gains
+# state-changing behaviour in a future PostgreSQL, or an encoding of the
+# same intent this list does not name. The control is the enforcement
+# boundary in the database plus the post-execution check; this layer exists
+# so that the common case never reaches them.
+_STATE_CHANGING_FUNCTIONS = frozenset({
+    # Session/GUC state -- the RLS identity attack.
+    "set_config",
+    "current_setting",
+    # Server state.
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_switch_wal",
+    "pg_create_restore_point",
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_stat_reset",
+    "pg_stat_statements_reset",
+    # Locks -- not reads, and a denial-of-service surface.
+    "pg_advisory_lock",
+    "pg_advisory_unlock",
+    "pg_advisory_xact_lock",
+    "pg_advisory_lock_shared",
+    # Filesystem and outbound access. These are superuser-gated, so a
+    # correctly configured readonly role would be refused anyway; blocked
+    # here so the refusal is ours and is visible, rather than arriving as
+    # an execution error that gets redacted into a generic message.
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "lo_import",
+    "lo_export",
+    "dblink",
+    "dblink_exec",
+})
+
+
+def _normalize_function_name(raw: object) -> str:
+    """sqlglot surfaces an unknown function as exp.Anonymous with its name
+    in `.this`. Quoting is preserved there ('"set_config"'), and casing is
+    whatever the author wrote, so both are stripped before comparison."""
+    name = str(raw or "").strip()
+    if name.startswith('"') and name.endswith('"') and len(name) > 1:
+        name = name[1:-1]
+    return name.lower()
+
+
+def _state_changing_calls(stmt: exp.Expression) -> list[str]:
+    """Every blocked function called ANYWHERE in the statement.
+
+    Depth matters more than it looks: in the attack shapes that worked, the
+    call was never at the top level. It sat in a subquery target list, a
+    CTE, a LATERAL, a window ORDER BY, a UNION arm or a CASE. find_all
+    walks all of them.
+    """
+    found: list[str] = []
+    for node in stmt.find_all(exp.Anonymous):
+        name = _normalize_function_name(node.this)
+        if name in _STATE_CHANGING_FUNCTIONS and name not in found:
+            found.append(name)
+    return sorted(found)
+
+
+@dataclass
+class GuardrailResult:
+    """Internal result type. GuardrailReport (the API contract) has no
+    safe_sql field by design, so routes.py reads safe_sql from here and
+    only copies the reportable fields into GuardrailReport."""
+    passed: bool
+    safe_sql: str
+    blocked_reasons: list[str] = field(default_factory=list)
+    injected_limit: int | None = None
+    checks_run: list[str] = field(default_factory=list)
+
+
+def check_guardrails(sql: str) -> GuardrailResult:
+    """Run static AST checks on a single candidate SQL statement.
+
+    Checks (in order, matching the checks_run vocabulary already baked into
+    the API contract / mock data): ddl_block, dml_block, row_limit,
+    subquery_depth.
+    """
+    try:
+        statements = [s for s in sqlglot.parse(sql, dialect="postgres") if s is not None]
+    except ParseError as e:
+        # sqlglot's ParseError message routinely echoes a snippet of the
+        # offending SQL (table/column names included) to show where parsing
+        # failed -- that's schema disclosure the same way a raw LLM refusal
+        # reason is, so the detail is logged server-side only; the reason
+        # returned here (and shown to the client via GuardrailReport) stays
+        # generic. See app/api/routes.py's matching client-message pattern.
+        logger.info("SQL failed to parse: %s", e)
+        return GuardrailResult(
+            passed=False,
+            safe_sql=sql,
+            blocked_reasons=["failed to parse SQL"],
+            checks_run=[],
+        )
+
+    if len(statements) == 0:
+        # Distinct from the multi-statement case below: an empty/blank SQL
+        # string usually means generation itself produced nothing (e.g. the
+        # LLM judged the question unanswerable), not a malformed statement.
+        return GuardrailResult(
+            passed=False,
+            safe_sql=sql,
+            blocked_reasons=["no SQL statement was generated (question may be unanswerable)"],
+            checks_run=[],
+        )
+
+    if len(statements) > 1:
+        # Stacked/multiple statements are a classic injection vector and we
+        # can't reason about "the" query if there's more than one.
+        return GuardrailResult(
+            passed=False,
+            safe_sql=sql,
+            blocked_reasons=[f"multiple SQL statements are not allowed (found {len(statements)})"],
+            checks_run=[],
+        )
+
+    stmt = statements[0]
+    checks_run: list[str] = []
+    blocked_reasons: list[str] = []
+
+    # --- ddl_block -----------------------------------------------------
+    checks_run.append("ddl_block")
+    if isinstance(stmt, _DDL_BLOCK_TYPES):
+        blocked_reasons.append(f"blocked statement: {type(stmt).__name__}")
+
+    # --- dml_block -------------------------------------------------------
+    checks_run.append("dml_block")
+    if isinstance(stmt, _DML_BLOCK_TYPES):
+        blocked_reasons.append(f"blocked statement: {type(stmt).__name__}")
+    elif not blocked_reasons and not isinstance(stmt, exp.Query):
+        # Catch-all for anything that isn't DDL/DML we already caught above
+        # but also isn't a read-only SELECT/UNION/WITH (exp.Query) -- e.g.
+        # GRANT, CALL, COPY. Folded into the dml_block gate rather than a
+        # 5th check name, to keep checks_run's vocabulary fixed at the 4
+        # values already baked into the API contract/mock data.
+        blocked_reasons.append(
+            f"blocked statement: {type(stmt).__name__} is not a read-only query"
+        )
+
+    # State-changing function calls, folded into the same gate for the same
+    # contract reason. A read-only SELECT can still rewrite the session
+    # variable an RLS policy reads -- see _STATE_CHANGING_FUNCTIONS.
+    if not blocked_reasons:
+        state_calls = _state_changing_calls(stmt)
+        if state_calls:
+            blocked_reasons.append(
+                "blocked function call: "
+                + ", ".join(state_calls)
+                + " changes session or server state"
+            )
+
+    # --- row_limit ---------------------------------------------------
+    checks_run.append("row_limit")
+    injected_limit: int | None = None
+    safe_stmt = stmt
+    if not blocked_reasons and isinstance(stmt, exp.Query):
+        if stmt.args.get("limit") is None:
+            injected_limit = settings.DEFAULT_ROW_LIMIT
+            safe_stmt = stmt.limit(injected_limit)  # returns a new node; does not mutate stmt
+
+    # --- subquery_depth ------------------------------------------------
+    checks_run.append("subquery_depth")
+    if not blocked_reasons:
+        max_depth = 0
+        for sq in stmt.find_all(exp.Subquery):
+            depth = 0
+            node: exp.Expression | None = sq
+            while node is not None:
+                if isinstance(node, exp.Subquery):
+                    depth += 1
+                node = node.parent
+            max_depth = max(max_depth, depth)
+        if max_depth > settings.MAX_SUBQUERY_DEPTH:
+            blocked_reasons.append(
+                f"subquery nesting depth {max_depth} exceeds max {settings.MAX_SUBQUERY_DEPTH}"
+            )
+
+    passed = not blocked_reasons
+    safe_sql = (safe_stmt.sql(dialect="postgres") + ";") if passed else sql
+
+    return GuardrailResult(
+        passed=passed,
+        safe_sql=safe_sql,
+        blocked_reasons=blocked_reasons,
+        injected_limit=injected_limit if passed else None,
+        checks_run=checks_run,
+    )

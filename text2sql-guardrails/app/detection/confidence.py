@@ -1,0 +1,163 @@
+"""
+Confidence fusion: combines four detector signals into one overall
+Confidence. The base score is a hand-tuned weighted mean with a hard
+fail-override; app.detection.calibration then applies an isotonic
+regression fit on held-out-verified data (see eval/fit_calibration.py) to
+turn that heuristic mean into an actually-calibrated P(correct) when a
+fitted calibrator artifact is present, and reports calibrated=True only
+then -- see the `calibrated` field below.
+
+multi_query_agreement was removed from the weighted set: the eval/
+ablation study (135-question golden set, see eval/learned_weights.md and
+eval/README.md) found it was the only signal whose removal *increased*
+fused-confidence AUROC (drop = -0.074), and standalone it was barely above
+chance (AUROC 0.532) -- it was actively hurting discrimination, not just
+failing to help. MULTI_QUERY_ENABLED now also defaults to false (was
+already false via app.config's env fallback), so app.detection.multi_query
+still runs (harmlessly, as a disabled neutral signal) if explicitly
+enabled, but its score is never weighted into the fused score below
+regardless -- it's simply not a key in WEIGHTS anymore.
+"""
+from __future__ import annotations
+
+from app.api.models import Confidence, ConfidenceSignal, SignalStatus
+from app.detection.calibration import calibrate
+
+# Weighted-mean weights, kept module-level so they're easy to tune (and to
+# cite in the paper) without touching the fusion logic itself. Renormalized
+# from the original 5-signal weights (0.30/0.25/0.20/0.10, sum 0.85) after
+# dropping multi_query_agreement, so these four still sum to 1.0.
+WEIGHTS: dict[str, float] = {
+    "schema_alignment": 0.35,
+    "back_translation_match": 0.29,
+    "result_sanity": 0.24,
+    "sql_validity": 0.12,
+}
+
+# Any signal at FAIL status forces the overall score down to this cap -- a
+# definite hallucination must never be reported as high confidence, no
+# matter how the weighted mean of the other signals looks.
+FAIL_SCORE_CAP = 0.40
+
+
+def _is_disabled(signal: ConfidenceSignal) -> bool:
+    """A detector that was turned off (e.g. BACK_TRANSLATION_ENABLED=false)
+    still returns a neutral WARN signal rather than being omitted, so the
+    response shape stays uniform. Those
+    neutral placeholders never actually measured anything, so they're
+    excluded from the weighted mean (and from the fail-override) rather
+    than dragging the average toward their placeholder score. Detected via
+    the 'disabled' marker each detector's disabled-state detail string
+    carries by convention -- a genuine LLM/API failure signal (also WARN,
+    also score 0.5) is intentionally NOT treated as disabled here, since it
+    reflects an attempted-but-failed measurement, not a skipped one."""
+    return bool(signal.detail) and "disabled" in signal.detail.lower()
+
+
+def compute_raw_score(
+    signals: list[ConfidenceSignal], weights: dict[str, float] | None = None
+) -> tuple[float, bool]:
+    """The hand-tuned weighted mean + FAIL_SCORE_CAP -- the score BEFORE
+    calibration. Factored out of fuse_confidence() specifically so eval
+    tooling that needs the genuinely raw, uncalibrated score (e.g.
+    eval/fit_calibration.py fitting a NEW calibrator) can get it without
+    calibrate() being silently applied first -- fuse_confidence() itself
+    always calibrates when a calibrator artifact is on disk, which for a
+    while meant every "raw hand-tuned score" reconstruction elsewhere in
+    this codebase (eval/analyze.py's reconstruct_confidence_score(),
+    eval/fit_calibration.py's build_rows()) was actually silently passing
+    scores through whatever calibrator happened to be loaded --
+    app/detection/calibrator.joblib, Anthropic-fit -- before a caller ever
+    saw them, including when fitting a calibrator meant to be independent
+    of it (e.g. a Gemini refit). See eval/README.md for the writeup.
+
+    `weights` defaults to the module's WEIGHTS (the live 4-signal set) but
+    accepts a different dict, e.g. for re-deriving an ablation over a
+    signal set WEIGHTS no longer includes (multi_query_agreement).
+
+    Returns (score, is_fail_capped) -- callers that go on to calibrate
+    need is_fail_capped to re-apply the cap after calibration, since a
+    fitted curve isn't trusted to preserve a hard safety invariant on its
+    own in a region it may have seen little data for.
+    """
+    if weights is None:
+        weights = WEIGHTS
+    present = [
+        s for s in signals
+        if s.key in weights and not _is_disabled(s)
+    ]
+    total_weight = sum(weights[s.key] for s in present)
+
+    if total_weight <= 0:
+        # Nothing was actually measured -- report neutral, not "definitely
+        # wrong" (0.0) or "definitely right" (1.0).
+        return 0.5, False
+
+    score = sum(weights[s.key] * s.score for s in present) / total_weight
+
+    is_fail_capped = any(s.status == SignalStatus.FAIL for s in present)
+    if is_fail_capped:
+        score = min(score, FAIL_SCORE_CAP)
+
+    return max(0.0, min(1.0, score)), is_fail_capped
+
+
+def fuse_confidence(
+    signals: list[ConfidenceSignal],
+    row_scoped: bool = False,
+) -> Confidence:
+    """`row_scoped` marks a request that ran under per-user RLS.
+
+    Such a request is scored from FEWER signals than the calibrator was fit
+    on: result_sanity reports itself unmeasured when the row-count-sensitive
+    checks are suppressed (see app/detection/result_sanity.py), so the
+    weighted mean is renormalised over what remains. The isotonic curve in
+    app/detection/calibration.py was fit on unscoped eval runs, where every
+    signal was present, and it has no claim to map this different input
+    distribution onto P(correct).
+
+    So the score is still reported -- it is a useful ordering -- but
+    `calibrated` is forced False, which is what the "uncalibrated" chip in
+    the UI already exists to say. Claiming calibration here would be the
+    same overreach this project criticises elsewhere: a number that looks
+    principled because it went through a fitted curve, on data that curve
+    never saw.
+
+    Fixing it properly means fitting a second calibrator on row-scoped runs.
+    That is future work, and it is honest to say so rather than to quietly
+    reuse the wrong one.
+    """
+    score, is_fail_capped = compute_raw_score(signals)
+
+    # eval/fit_calibration.py fits an isotonic regression mapping this raw
+    # hand-tuned score -> P(correct), on a question-level 60/40 train/test
+    # split (never row-level, to avoid leaking repeats of the same question
+    # across the boundary). See eval/reliability_holdout.png and that
+    # script's printed AUROC/ECE for the held-out numbers that justified
+    # wiring it in here. calibrated=True only when an actual fitted
+    # calibrator was loaded -- a missing artifact degrades to the raw score
+    # with calibrated=False, exactly as before this existed.
+    score, calibrated = calibrate(score)
+    if row_scoped:
+        calibrated = False
+    # Re-apply the FAIL cap after calibration: it's a hard safety invariant
+    # ("a definite hallucination must never be reported as high
+    # confidence"), not a statistical property the calibration curve should
+    # be trusted to preserve on its own in a region the fit may have seen
+    # little data for.
+    if is_fail_capped:
+        score = min(score, FAIL_SCORE_CAP)
+
+    if score >= 0.80:
+        label = "High"
+    elif score >= 0.55:
+        label = "Medium"
+    else:
+        label = "Low"
+
+    return Confidence(
+        score=round(score, 2),
+        label=label,
+        calibrated=calibrated,
+        signals=signals,
+    )
