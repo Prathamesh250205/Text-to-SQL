@@ -74,3 +74,7 @@ database during generation. Results:
 - 0 orphaned foreign keys spot-checked across `marks`, `fee_payments`, `library_transactions`, `placement_applications` against `students`.
 - All row counts confirmed via `pg_stat_user_tables` after load.
 
+
+## Team
+
+Team project by Prathamesh Gulavani ([@Prathamesh250205](https://github.com/Prathamesh250205)) and Pradnesh ([@Pradnesh02](https://github.com/Pradnesh02)). Original repository: [Text-To-SQL-Project/G-52-Project](https://github.com/Text-To-SQL-Project/G-52-Project).
